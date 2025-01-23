@@ -4,12 +4,12 @@ from flask import Flask, render_template_string, request, jsonify
 
 app = Flask(__name__)
 
-# --- Глобальные переменные для логики ---
-pc_data = {}            # Словарь: { "pc1": (lobby_id, timestamp), "pc2": (lobby_id, timestamp), ... }
-current_game_state = "waiting"  # Может быть: "waiting", "accept", "reject"
+# --- Глобальные переменные ---
+pc_data = {}                   # { "pc1": (lobby_id, timestamp), ... }
+current_game_state = "waiting"
 start_time = None
-game_history = []       # Список словарей с историей
-REQUIRED_PCS = 4        # Сколько ПК должно отправить ID
+game_history = []              # Список dict, где каждая игра = {timestamp, lobby_id, status}
+REQUIRED_PCS = 4               # Сколько ПК должно отправить ID
 
 # --- Встроенный HTML-шаблон ---
 HTML_TEMPLATE = """
@@ -22,7 +22,7 @@ HTML_TEMPLATE = """
     <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/css/bootstrap.min.css">
     <style>
         body {
-            background-color: #f8f9fa; /* Светлый фон для контраста */
+            background-color: #f8f9fa;
             color: #212529;
             margin-bottom: 3rem;
         }
@@ -127,46 +127,48 @@ HTML_TEMPLATE = """
 </html>
 """
 
-# --- Логика сброса состояния ---
+# --- Сброс состояния ---
 def reset_state():
-    """Сброс всех глобальных переменных в начальное состояние."""
     global pc_data, current_game_state, start_time
     pc_data.clear()
     current_game_state = "waiting"
     start_time = None
 
-# --- Поток, который через 6 секунд решает, Accept или Reject ---
-def check_all_after_6_seconds():
+# --- Проверка через 10 сек + сброс в 17 сек ---
+def check_all_in_10s_and_reset_in_17():
     global current_game_state
-    time.sleep(6)
 
-    # Проверяем, успели ли все 4 ПК отправить ID
+    # Ждём 10 секунд, чтобы дать время всем 4 ПК отправить ID
+    time.sleep(10)
+
+    # Если меньше 4 ПК успели прислать — reject
     if len(pc_data) < REQUIRED_PCS:
         current_game_state = "reject"
-        reset_state()
-        return
-
-    # Проверяем, совпадают ли все lobby_id
-    all_lobby_ids = {data[0] for data in pc_data.values()}
-    if len(all_lobby_ids) == 1:
-        # Все 4 совпали
-        current_game_state = "accept"
-        lobby_id = all_lobby_ids.pop()
-        # Добавляем запись в историю
-        game_history.append({
-            "timestamp": time.strftime("%Y-%m-%d %H:%M:%S"),
-            "lobby_id": lobby_id,
-            "status": "Game started"
-        })
-        # Ждём 5 сек, чтобы статус "accept" был виден
-        time.sleep(5)
-        reset_state()
     else:
-        # IDs оказались разными
-        current_game_state = "reject"
-        reset_state()
+        # Проверяем, совпадают ли все lobby_id
+        all_lobby_ids = {data[0] for data in pc_data.values()}
+        if len(all_lobby_ids) == 1:
+            current_game_state = "accept"
+            lobby_id = all_lobby_ids.pop()
+            # Новые записи в начало (чтобы сверху)
+            game_history.insert(0, {
+                "timestamp": time.strftime("%Y-%m-%d %H:%M:%S"),
+                "lobby_id": lobby_id,
+                "status": "Game started"
+            })
+        else:
+            current_game_state = "reject"
 
-# --- Маршрут на главную (рендерим HTML_TEMPLATE) ---
+    # Ждём, пока общее время с момента первого запроса не достигнет 17 сек
+    if start_time is not None:
+        total_elapsed = time.time() - start_time
+        remain = 17 - total_elapsed
+        if remain > 0:
+            time.sleep(remain)
+
+    reset_state()
+
+# --- Маршрут на главную (рендерим шаблон) ---
 @app.route("/")
 def index():
     return render_template_string(
@@ -176,7 +178,7 @@ def index():
         game_history=game_history
     )
 
-# --- Приём лобби-ID от ПК (POST) ---
+# --- Приём лобби-ID (POST) ---
 @app.route("/send_lobby_id", methods=["POST"])
 def send_lobby_id():
     global current_game_state, start_time
@@ -191,13 +193,14 @@ def send_lobby_id():
     # Запоминаем
     pc_data[pc_name] = (lobby_id, time.time())
 
-    # Если это первый ID в раунде, запоминаем время и запускаем поток проверки
+    # Если это первый лобби-ID в данном "раунде"
     if start_time is None:
         start_time = time.time()
-        t = threading.Thread(target=check_all_after_6_seconds)
+        # Запускаем поток, который через 10 сек проверит (Accept/Reject),
+        # а на 17-й секунде сбросит состояние
+        t = threading.Thread(target=check_all_in_10s_and_reset_in_17)
         t.start()
 
-    # Возвращаем простой ответ
     return jsonify({"status": "received"})
 
 # --- Проверка статуса (GET) ---
@@ -205,7 +208,6 @@ def send_lobby_id():
 def check_status():
     return jsonify({"status": current_game_state})
 
-# --- Точка входа ---
+# --- Запуск приложения ---
 if __name__ == "__main__":
-    # Запускаем сервер. debug=True — чтобы удобно было отлаживать.
     app.run(host="0.0.0.0", port=5000, debug=True)
